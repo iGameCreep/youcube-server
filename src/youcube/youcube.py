@@ -33,6 +33,7 @@ except ImportError:
 
 # pip modules
 from sanic import Request, Sanic, Websocket
+from sanic.worker.loader import AppLoader
 from sanic.compat import open_async
 from sanic.exceptions import SanicException
 from sanic.handlers import ErrorHandler
@@ -309,15 +310,6 @@ class CustomErrorHandler(ErrorHandler):
 
         return super().default(request, exception)
 
-
-app = Sanic("youcube")
-app.error_handler = CustomErrorHandler()
-# FIXME: The Client is not Responsing to Websocket pings
-app.config.WEBSOCKET_PING_INTERVAL = 0
-# FIXME: Add UVLOOP support for alpine pypy
-if getenv("SANIC_NO_UVLOOP"):
-    app.config.USE_UVLOOP = False
-
 actions = {}
 
 # add all actions from default action set
@@ -352,114 +344,125 @@ def data_cache_cleaner(data: dict):
         pass
 
 
-# pylint: disable=redefined-outer-name
-@app.main_process_ready
-async def ready(app: Sanic, _):
-    """See https://sanic.dev/en/guide/basics/listeners.html"""
-    if DATA_CACHE_CLEANUP_INTERVAL > 0 and DATA_CACHE_CLEANUP_AFTER > 0:
-        app.manager.manage(
-            "Data-Cache-Cleaner", data_cache_cleaner, {"data": app.shared_ctx.data}
+def load_app(app: Sanic):
+    # pylint: disable=redefined-outer-name
+    @app.main_process_ready
+    async def ready(app: Sanic, _):
+        """See https://sanic.dev/en/guide/basics/listeners.html"""
+        if DATA_CACHE_CLEANUP_INTERVAL > 0 and DATA_CACHE_CLEANUP_AFTER > 0:
+            app.manager.manage(
+                "Data-Cache-Cleaner", data_cache_cleaner, {"data": app.shared_ctx.data}
+            )
+
+
+    @app.main_process_start
+    async def main_start(app: Sanic):
+        """See https://sanic.dev/en/guide/basics/listeners.html"""
+        app.shared_ctx.data = Manager().dict()
+
+        if which(FFMPEG_PATH) is None:
+            logger.warning("FFmpeg not found.")
+
+        if which(SANJUUNI_PATH) is None:
+            logger.warning("Sanjuuni not found.")
+
+        if spotipy:
+            logger.info("Spotipy Enabled")
+        else:
+            logger.info("Spotipy Disabled")
+
+
+    @app.route("/dfpwm/<media_id:str>/<chunkindex:int>")
+    async def stream_dfpwm(_request: Request, media_id: str, chunkindex: int):
+        """WIP HTTP mode"""
+        return raw(await getchunk(join(DATA_FOLDER, get_audio_name(media_id)), chunkindex))
+
+
+    @app.route("/32vid/<media_id:str>/<width:int>/<height:int>/<tracker:int>")  # , stream=True
+    async def stream_32vid(
+        _request: Request, media_id: str, width: int, height: int, tracker: int
+    ):
+        """WIP HTTP mode"""
+        return raw(
+            "\n".join(
+                await get_vid(join(DATA_FOLDER, get_video_name(media_id, width, height)), tracker)
+            )
         )
 
 
-@app.main_process_start
-async def main_start(app: Sanic):
-    """See https://sanic.dev/en/guide/basics/listeners.html"""
-    app.shared_ctx.data = Manager().dict()
-
-    if which(FFMPEG_PATH) is None:
-        logger.warning("FFmpeg not found.")
-
-    if which(SANJUUNI_PATH) is None:
-        logger.warning("Sanjuuni not found.")
-
-    if spotipy:
-        logger.info("Spotipy Enabled")
-    else:
-        logger.info("Spotipy Disabled")
-
-
-@app.route("/dfpwm/<media_id:str>/<chunkindex:int>")
-async def stream_dfpwm(_request: Request, media_id: str, chunkindex: int):
-    """WIP HTTP mode"""
-    return raw(await getchunk(join(DATA_FOLDER, get_audio_name(media_id)), chunkindex))
-
-
-@app.route("/32vid/<media_id:str>/<width:int>/<height:int>/<tracker:int>")  # , stream=True
-async def stream_32vid(
-    _request: Request, media_id: str, width: int, height: int, tracker: int
-):
-    """WIP HTTP mode"""
-    return raw(
-        "\n".join(
-            await get_vid(join(DATA_FOLDER, get_video_name(media_id, width, height)), tracker)
+    """"
+    from sanic import response
+    @app.route("/dfpwm/<id:str>")
+    async def stream_dfpwm(request: Request, id: str):
+        file_name = get_audio_name(id)
+        file = join(DATA_FOLDER, get_audio_name(id))
+        return await response.file_stream(
+            file,
+            chunk_size=CHUNKS_AT_ONCE,
+            mime_type="application/metalink4+xml",
+            headers={
+                "Content-Disposition": f'Attachment; filename="{file_name}"',
+                "Content-Type": "application/metalink4+xml",
+            },
         )
-    )
+
+    @app.route("/32vid/<id:str>/<width:int>/<height:int>", stream=True)
+    async def stream_32vid(request: Request, id: str, width: int, height: int):
+        file_name = get_video_name(id, width, height)
+        file = join(
+            DATA_FOLDER,
+            file_name
+        )
+        return await response.file_stream(
+            file,
+            chunk_size=10,
+            mime_type="application/metalink4+xml",
+            headers={
+                "Content-Disposition": f'Attachment; filename="{file_name}"',
+                "Content-Type": "application/metalink4+xml",
+            },
+        )
+    """
+    # pylint: enable=redefined-outer-name
 
 
-""""
-from sanic import response
-@app.route("/dfpwm/<id:str>")
-async def stream_dfpwm(request: Request, id: str):
-    file_name = get_audio_name(id)
-    file = join(DATA_FOLDER, get_audio_name(id))
-    return await response.file_stream(
-        file,
-        chunk_size=CHUNKS_AT_ONCE,
-        mime_type="application/metalink4+xml",
-        headers={
-            "Content-Disposition": f'Attachment; filename="{file_name}"',
-            "Content-Type": "application/metalink4+xml",
-        },
-    )
+    @app.websocket("/")
+    # pylint: disable-next=invalid-name
+    async def wshandler(request: Request, ws: Websocket):
+        """Handels web-socket requests"""
+        if NO_COLOR:
+            prefix = f"[{request.client_ip}] "
+        else:
+            prefix = f"{Foreground.BLUE}[{request.client_ip}]{RESET} "
 
-@app.route("/32vid/<id:str>/<width:int>/<height:int>", stream=True)
-async def stream_32vid(request: Request, id: str, width: int, height: int):
-    file_name = get_video_name(id, width, height)
-    file = join(
-        DATA_FOLDER,
-        file_name
-    )
-    return await response.file_stream(
-        file,
-        chunk_size=10,
-        mime_type="application/metalink4+xml",
-        headers={
-            "Content-Disposition": f'Attachment; filename="{file_name}"',
-            "Content-Type": "application/metalink4+xml",
-        },
-    )
-"""
-# pylint: enable=redefined-outer-name
+        logger.info("%sConnected!", prefix)
 
+        logger.debug("%sMy headers are: %s", prefix, request.headers)
 
-@app.websocket("/")
-# pylint: disable-next=invalid-name
-async def wshandler(request: Request, ws: Websocket):
-    """Handels web-socket requests"""
-    if NO_COLOR:
-        prefix = f"[{request.client_ip}] "
-    else:
-        prefix = f"{Foreground.BLUE}[{request.client_ip}]{RESET} "
+        while True:
+            message = await ws.recv()
+            logger.debug("%sMessage: %s", prefix, message)
 
-    logger.info("%sConnected!", prefix)
+            try:
+                message: dict = load_json(message)
+            except JSONDecodeError:
+                logger.debug("%sFaild to parse Json", prefix)
+                await ws.send(dumps({"action": "error", "message": "Faild to parse Json"}))
 
-    logger.debug("%sMy headers are: %s", prefix, request.headers)
+            if message.get("action") in actions:
+                response = await actions[message.get("action")](message, ws, request)
+                await ws.send(dumps(response))
 
-    while True:
-        message = await ws.recv()
-        logger.debug("%sMessage: %s", prefix, message)
-
-        try:
-            message: dict = load_json(message)
-        except JSONDecodeError:
-            logger.debug("%sFaild to parse Json", prefix)
-            await ws.send(dumps({"action": "error", "message": "Faild to parse Json"}))
-
-        if message.get("action") in actions:
-            response = await actions[message.get("action")](message, ws, request)
-            await ws.send(dumps(response))
-
+def create_app() -> Sanic:
+    app = Sanic("youcube")
+    app.error_handler = CustomErrorHandler()
+    # FIXME: The Client is not Responsing to Websocket pings
+    app.config.WEBSOCKET_PING_INTERVAL = 0
+    # FIXME: Add UVLOOP support for alpine pypy
+    if getenv("SANIC_NO_UVLOOP"):
+        app.config.USE_UVLOOP = False
+    load_app(app)
+    return app
 
 def main() -> None:
     """
@@ -469,7 +472,11 @@ def main() -> None:
     host = getenv("HOST", "127.0.0.1")
     fast = not getenv("NO_FAST")
 
-    app.run(host=host, port=port, fast=fast, access_log=True)
+    loader = AppLoader(factory=create_app)
+
+    app = loader.load()
+    app.prepare(port=5000, dev=True)
+    Sanic.serve(primary=app, app_loader=loader)
 
 
 if __name__ == "__main__":
